@@ -103,3 +103,88 @@ grant update, delete on public.orders, public.order_items to authenticated;
 
 -- Explicit server-side role permissions for trusted Edge Functions.
 grant all privileges on public.products, public.orders, public.order_items to service_role;
+
+
+-- Starter catalogue. Replace sample content/prices/stock before accepting real customers.
+insert into public.products (slug,name,description,category,price_inr,compare_at_price_inr,emoji,badge,rating,stock_quantity,is_active)
+values
+ ('studio-wireless-headphones','Studio Wireless Headphones','Wireless everyday listening headphones','Tech',2499,3299,'🎧','BESTSELLER',4.8,100,true),
+ ('smart-fitness-watch','Smart Fitness Watch','Smart watch for daily activity','Tech',1899,2499,'⌚','POPULAR',4.7,100,true),
+ ('everyday-sling-bag','Everyday Sling Bag','Compact everyday carry bag','Lifestyle',999,1299,'🎒','NEW',4.6,100,true),
+ ('minimal-desk-lamp','Minimal Desk Lamp','Minimal light for your desk','Home',799,1099,'💡','VALUE PICK',4.5,100,true),
+ ('portable-bluetooth-speaker','Portable Bluetooth Speaker','Portable speaker for everyday use','Tech',1499,1999,'🔊','TRENDING',4.7,100,true),
+ ('insulated-travel-bottle','Insulated Travel Bottle','Reusable insulated travel bottle','Lifestyle',499,699,'🥤','DAILY ESSENTIAL',4.6,100,true),
+ ('soft-glow-table-light','Soft Glow Table Light','Warm table lighting','Home',1199,1599,'🪔','NEW',4.5,100,true),
+ ('wireless-charging-pad','Wireless Charging Pad','Wireless charging pad','Tech',899,1199,'🔋','SMART PICK',4.6,100,true)
+on conflict (slug) do nothing;
+
+-- Atomic order creation: lock products, calculate prices in the database, decrement stock,
+-- and write order + line items in a single transaction. Invoker privileges are retained.
+create or replace function public.create_shopnex_order(
+  p_customer_name text,
+  p_customer_phone text,
+  p_address_line text,
+  p_payment_method text,
+  p_customer_id uuid,
+  p_items jsonb
+) returns jsonb
+language plpgsql
+security invoker
+set search_path = ''
+as $$
+declare
+  v_order_id uuid;
+  v_order_number text;
+  v_subtotal integer := 0;
+  v_item jsonb;
+  v_slug text;
+  v_qty integer;
+  v_product public.products%rowtype;
+begin
+  if char_length(trim(p_customer_name)) < 2 or char_length(trim(p_customer_name)) > 100 then
+    raise exception 'Invalid customer name';
+  end if;
+  if char_length(trim(p_customer_phone)) < 10 or char_length(trim(p_customer_phone)) > 20 then
+    raise exception 'Invalid phone number';
+  end if;
+  if char_length(trim(p_address_line)) < 8 or char_length(trim(p_address_line)) > 500 then
+    raise exception 'Invalid delivery address';
+  end if;
+  if p_payment_method <> 'cod' then raise exception 'Online payments are not enabled'; end if;
+  if jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) < 1 or jsonb_array_length(p_items) > 30 then
+    raise exception 'Invalid cart';
+  end if;
+
+  -- First pass validates availability and calculates the authoritative total while locking rows.
+  for v_item in select value from jsonb_array_elements(p_items)
+  loop
+    v_slug := v_item ->> 'slug';
+    v_qty := (v_item ->> 'quantity')::integer;
+    if v_qty < 1 or v_qty > 50 then raise exception 'Invalid item quantity'; end if;
+    select * into v_product from public.products where slug = v_slug and is_active = true for update;
+    if not found then raise exception 'Product unavailable'; end if;
+    if v_product.stock_quantity < v_qty then raise exception 'Insufficient stock for %', v_product.name; end if;
+    v_subtotal := v_subtotal + (v_product.price_inr * v_qty);
+  end loop;
+  if v_subtotal > 10000000 then raise exception 'Order total too high'; end if;
+
+  insert into public.orders (customer_id, customer_name, customer_phone, address_line, payment_method, payment_status, order_status, subtotal_inr, shipping_inr, total_inr)
+  values (p_customer_id, trim(p_customer_name), trim(p_customer_phone), trim(p_address_line), 'cod', 'pending', 'placed', v_subtotal, 0, v_subtotal)
+  returning id, order_number into v_order_id, v_order_number;
+
+  for v_item in select value from jsonb_array_elements(p_items)
+  loop
+    v_slug := v_item ->> 'slug';
+    v_qty := (v_item ->> 'quantity')::integer;
+    select * into v_product from public.products where slug = v_slug and is_active = true for update;
+    insert into public.order_items (order_id, product_id, product_name, unit_price_inr, quantity, line_total_inr)
+    values (v_order_id, v_product.id, v_product.name, v_product.price_inr, v_qty, v_product.price_inr * v_qty);
+    update public.products set stock_quantity = stock_quantity - v_qty, updated_at = now() where id = v_product.id;
+  end loop;
+
+  return jsonb_build_object('id', v_order_id, 'order_number', v_order_number, 'total_inr', v_subtotal, 'order_status', 'placed', 'created_at', now());
+end;
+$$;
+
+revoke all on function public.create_shopnex_order(text,text,text,text,uuid,jsonb) from public, anon, authenticated;
+grant execute on function public.create_shopnex_order(text,text,text,text,uuid,jsonb) to service_role;
