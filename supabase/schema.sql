@@ -100,3 +100,6 @@ grant select on public.products to anon, authenticated;
 grant select on public.orders, public.order_items to authenticated;
 grant insert, update, delete on public.products to authenticated;
 grant update, delete on public.orders, public.order_items to authenticated;
+
+-- Explicit server-side role permissions for trusted Edge Functions.
+grant all privileges on public.products, public.orders, public.order_items to service_role;
